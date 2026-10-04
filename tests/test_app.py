@@ -30,7 +30,8 @@ def _make_app(thresholds: list[float] | None = None) -> UsageMonitorForClaude:
         thresholds = [80, 95]
     with patch('usage_monitor_for_claude.app.pystray'), \
          patch('usage_monitor_for_claude.app.create_icon_image'), \
-         patch('usage_monitor_for_claude.app.taskbar_uses_light_theme', return_value=False):
+         patch('usage_monitor_for_claude.app.taskbar_uses_light_theme', return_value=False), \
+         patch('usage_monitor_for_claude.app.install_tray_activate_handler'):
         app = UsageMonitorForClaude()
     app.icon = MagicMock()
     # Patches active for the app's lifetime, stopped by _cleanup.  The presence
@@ -3563,6 +3564,21 @@ class TestAutostartWiring(unittest.TestCase):
         self._ready(supported=False).assert_not_called()
 
 
+class TestActivateWiring(unittest.TestCase):
+    """Tests for wiring the panel's left-click to the popup."""
+
+    def test_left_click_opens_the_popup(self):
+        """The activate handler is always installed and opens the popup, command or not."""
+        with patch('usage_monitor_for_claude.app.pystray'), \
+             patch('usage_monitor_for_claude.app.create_icon_image'), \
+             patch('usage_monitor_for_claude.app.taskbar_uses_light_theme', return_value=False), \
+             patch('usage_monitor_for_claude.app.QUICK_ACTION_COMMAND', []), \
+             patch('usage_monitor_for_claude.app.install_tray_activate_handler') as mock_install:
+            app = UsageMonitorForClaude()
+
+        mock_install.assert_called_once_with(app.on_show_popup)
+
+
 class TestDoubleClickWiring(unittest.TestCase):
     """Tests for wiring the optional double-click command to the tray icon."""
 
@@ -3579,6 +3595,7 @@ class TestDoubleClickWiring(unittest.TestCase):
         with patch('usage_monitor_for_claude.app.pystray'), \
              patch('usage_monitor_for_claude.app.create_icon_image'), \
              patch('usage_monitor_for_claude.app.taskbar_uses_light_theme', return_value=False), \
+             patch('usage_monitor_for_claude.app.install_tray_activate_handler'), \
              patch('usage_monitor_for_claude.app.install_tray_click_handler', return_value=installed) as mock_install, \
              patch('builtins.print') as mock_print:
             app = UsageMonitorForClaude()
