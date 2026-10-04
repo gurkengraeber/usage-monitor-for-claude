@@ -197,15 +197,21 @@ class PopupHost:
 
         StatusNotifierItem never reports where the panel drew the icon - no
         protocol carries that - so the popup anchors to the work-area corner
-        the icon sits in.
+        the icon sits in.  A panel on the top edge pushes the work area down
+        and the popup hangs below it; in every other layout the popup rests
+        on the bottom edge, above a bottom panel.
         """
         monitor = self._primary_monitor()
         if monitor is None:
             return None
 
         work = monitor.get_workarea()
+        x = work.x + work.width - self._width - _MARGIN
 
-        return work.x + work.width - self._width - _MARGIN, work.y + _MARGIN
+        if work.y > monitor.get_geometry().y:
+            return x, work.y + _MARGIN
+
+        return x, work.y + work.height - self._height - _MARGIN
 
     def _connect_dismiss_signals(self, gtk_window: Any) -> None:
         """Wire the dismissal signals.  Runs on the GTK main loop."""
