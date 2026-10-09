@@ -580,6 +580,11 @@ class TestInstallTrayActivateHandler(unittest.TestCase):
         modules.start()
         self.addCleanup(modules.stop)
 
+        # Keeps the mocked connection out of the real exit handlers.
+        register = patch.object(linux.atexit, 'register')
+        self.mock_register = register.start()
+        self.addCleanup(register.stop)
+
     def _filter(self):
         self.assertTrue(linux.install_tray_activate_handler(self.on_activate))
 
@@ -623,6 +628,20 @@ class TestInstallTrayActivateHandler(unittest.TestCase):
 
         self.connection.send_message.assert_not_called()
         self.on_activate.assert_not_called()
+
+    def test_filter_is_removed_at_exit(self):
+        """A filter left registered runs during interpreter shutdown and crashes the process."""
+        self.assertTrue(linux.install_tray_activate_handler(self.on_activate))
+
+        self.mock_register.assert_called_once_with(self.connection.remove_filter, self.connection.add_filter.return_value)
+
+    def test_nothing_is_registered_without_a_session_bus(self):
+        """Without a filter there is nothing to clean up."""
+        self.gio.bus_get_sync.side_effect = self.glib.Error
+
+        linux.install_tray_activate_handler(self.on_activate)
+
+        self.mock_register.assert_not_called()
 
     def test_reports_unavailable_without_a_session_bus(self):
         """No bus means no panel to answer; the caller must be able to tell."""

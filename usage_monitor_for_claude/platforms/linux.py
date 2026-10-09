@@ -13,6 +13,7 @@ or GTK is unavailable rather than raising.
 """
 from __future__ import annotations
 
+import atexit
 import functools
 import locale
 import os
@@ -677,6 +678,10 @@ def install_tray_activate_handler(on_activate: Callable[[], None]) -> bool:
     instead, so the click behaves as it does on Windows; the menu stays on
     the right-click.  Panels that never call ``Activate`` are unaffected.
 
+    The filter is removed again at exit: the connection outlives the
+    interpreter's ability to run Python code, and a message sent through a
+    filter that can no longer run crashes the process.
+
     Returns False when PyGObject or the session bus is unavailable.
     """
     try:
@@ -704,7 +709,8 @@ def install_tray_activate_handler(on_activate: Callable[[], None]) -> bool:
 
         return None
 
-    connection.add_filter(on_message)
+    filter_id = connection.add_filter(on_message)
+    atexit.register(connection.remove_filter, filter_id)
 
     return True
 

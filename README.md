@@ -147,9 +147,8 @@ Three notes specific to Linux:
   the detail popup could not be anchored below the tray icon. The app sets `GDK_BACKEND=x11` itself;
   set that variable explicitly if you want to try the native backend.
 
-A StatusNotifierItem is drawn and driven by the panel, so what a left-click does is the panel's
-decision. KDE Plasma passes it on and the detail popup opens directly; panels that open the menu
-on every click offer the popup as its first entry.
+On KDE Plasma a left-click opens the detail popup. On panels that open the menu on every click,
+such as GNOME, the popup is the menu's first entry.
 
 On startup the tray library prints `libayatana-appindicator is deprecated`. Nothing is broken - the
 icon works as it should. pystray still uses that library's GTK-3 API, and the replacement
