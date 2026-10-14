@@ -23,14 +23,21 @@ when violated - every pywebview call still reports success:
 from __future__ import annotations
 
 import threading
+import time
 from typing import Any, Callable
 
-__all__ = ['WINDOW_KWARGS', 'PopupHost', 'popup_url']
+__all__ = ['REUSE_WINDOW', 'WINDOW_KWARGS', 'PopupHost', 'popup_url']
 
 # Extra ``webview.create_window`` options for this platform.  GTK ignores
 # ``resize()`` on a non-resizable window, so the content-driven height would
 # never be applied; a frameless window has no visible grips to drag anyway.
 WINDOW_KWARGS = {'resizable': True}
+
+# Whether one popup window is kept and reloaded for every opening.  On GTK
+# every pywebview window starts its own WebKit web and network process, and
+# ``destroy()`` does not stop them, so each destroyed window would hold about
+# 200 MB until the app quits.  See :class:`~usage_monitor_for_claude.popup.PopupWindowCache`.
+REUSE_WINDOW = True
 
 _MARGIN = 8
 
@@ -39,6 +46,12 @@ _WATCH_HEARTBEAT = 2.0
 
 # Escape, as reported by Gdk key events.
 _KEY_ESCAPE = 0xFF1B
+
+# Seconds after the reveal during which a focus-out is not a dismissal.  The
+# compositor reports one for a window it has just mapped; whether it lands
+# before or after the reveal depends on how quickly the page answered, and a
+# popup shown again answers quickly enough to lose that race.
+_FOCUS_SETTLE_SECONDS = 0.5
 
 
 def popup_url(path: Any) -> str:
@@ -63,6 +76,8 @@ class PopupHost:
         self._should_dismiss: Callable[[], bool] = lambda: False
         self._drag_offset = (0, 0)
         self._dragging = False
+        self._signals_connected = False
+        self._focus_settled_at = 0.0
 
     def prepare(self) -> None:
         """Put the window on screen but fully transparent.
@@ -76,7 +91,13 @@ class PopupHost:
 
     def reveal(self) -> None:
         """Map, position, focus and finally show the prepared window."""
+        self._focus_settled_at = time.monotonic() + _FOCUS_SETTLE_SECONDS
         self._on_main_loop(self._reveal_on_main_loop)
+
+    def hide(self) -> None:
+        """Take the popup off screen but keep its window for the next opening."""
+        self._dragging = False
+        self._on_main_loop(lambda gtk_window: gtk_window.hide())
 
     def apply_geometry(self, height: int, *, keep_position: bool) -> None:
         """Resize to *height* and remember whether the anchor still applies.
@@ -208,11 +229,22 @@ class PopupHost:
         return work.x + work.width - self._width - _MARGIN, work.y + _MARGIN
 
     def _connect_dismiss_signals(self, gtk_window: Any) -> None:
-        """Wire the dismissal signals.  Runs on the GTK main loop."""
+        """Wire the dismissal signals once.  Runs on the GTK main loop.
+
+        The window outlives a single opening, so later watches reuse the
+        handlers; connecting again would stack one more per opening.
+        """
+        if self._signals_connected:
+            return
+
+        self._signals_connected = True
         gtk_window.connect('focus-out-event', self._on_focus_out)
         gtk_window.connect('key-press-event', self._on_key_press)
 
     def _on_focus_out(self, *_args: object) -> bool:
+        if time.monotonic() < self._focus_settled_at:
+            return False
+
         if self._should_dismiss():
             self._dismissed.set()
 
