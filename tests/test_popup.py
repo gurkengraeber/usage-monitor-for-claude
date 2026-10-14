@@ -779,10 +779,12 @@ class TestDismissWatchShutdown(unittest.TestCase):
 
         popup = object.__new__(UsagePopup)
         popup._running = True
+        popup._close_started = False
         popup._pinned = pinned
         popup._shown = True
         popup._closed = threading.Event()
         popup._window = MagicMock()
+        popup._window_cache = None
         popup._host = host
 
         thread = threading.Thread(target=popup._dismiss_watch, daemon=True)
@@ -1144,6 +1146,20 @@ class TestPopupWindowCache(unittest.TestCase):
         second._on_window_closed.assert_not_called()
         self.assertIs(second._window, self.windows[1])
 
+    def test_loaded_event_of_a_discarded_window_is_ignored(self):
+        """A late load of the replaced window must not initialise the popup a second time."""
+        first, second = MagicMock(), MagicMock()
+        self.cache.attach(first)
+        self.cache.release(first)
+        self.windows[0].load_url.side_effect = RuntimeError('reload failed')
+        self.cache.attach(second)
+
+        self.windows[0].events.loaded.fire()
+        second._on_loaded.assert_not_called()
+
+        self.windows[1].events.loaded.fire()
+        second._on_loaded.assert_called_once()
+
 
 class TestPopupWithWindowCache(unittest.TestCase):
     """Tests for how UsagePopup treats a kept window."""
@@ -1151,6 +1167,7 @@ class TestPopupWithWindowCache(unittest.TestCase):
     def _popup(self, cache):
         popup = object.__new__(UsagePopup)
         popup._running = True
+        popup._close_started = False
         popup._shown = True
         popup._last_height = 0
         popup._closed = threading.Event()

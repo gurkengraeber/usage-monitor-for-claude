@@ -358,9 +358,6 @@ class UsagePopup:
     _CHECK_MS = 2000
     _INITIAL_HEIGHT = 400
 
-    _window_cache: PopupWindowCache | None = None
-    _close_started = False
-
     def __init__(self, app: UsageMonitorForClaude, window_cache: PopupWindowCache | None = None) -> None:
         """Create and display a popup window with usage details.
 
@@ -378,6 +375,7 @@ class UsagePopup:
         self.app = app
         self._window_cache = window_cache
         self._running = True
+        self._close_started = False
         self._pinned = False
         self._moved_while_pinned = False
         self._shown = False
