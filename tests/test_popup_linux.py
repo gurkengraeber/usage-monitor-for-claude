@@ -30,6 +30,7 @@ def _host(window=None, gtk_window=None):
     gtk_window = gtk_window or MagicMock()
     host._gtk_window = lambda: gtk_window
     host._on_main_loop = lambda action: action(gtk_window)
+    host._css_scale = lambda: 1.0
 
     return host, gtk_window
 
@@ -155,6 +156,84 @@ class TestApplyGeometry(unittest.TestCase):
         host.apply_geometry(565, keep_position=True)
         window.resize.assert_called_once_with(WIDTH, 565)
         gtk_window.move.assert_not_called()
+
+
+class _FakeX11Display:
+    """Stands in for ``GdkX11.X11Display``, reporting a fixed screen resolution."""
+
+    def __init__(self, resolution):
+        self._resolution = resolution
+
+    def get_default_screen(self):
+        return MagicMock(get_resolution=lambda: self._resolution)
+
+
+class TestCssScale(unittest.TestCase):
+    """Tests for matching the window size to WebKit's device scale.
+
+    At a fractional scale GTK uses an integer factor while WebKit uses the
+    screen resolution, so the page would get less than the whole window.
+    """
+
+    def _scale(self, display):
+        host = PopupHost(MagicMock(), WIDTH)
+        fake_gdkx11 = MagicMock(X11Display=_FakeX11Display)
+        with patch.dict(sys.modules, {'gi': MagicMock(), 'gi.repository': MagicMock(GdkX11=fake_gdkx11)}), \
+             patch.object(host, '_display', return_value=display):
+            return host._css_scale()
+
+    def test_fractional_scale_enlarges_the_window(self):
+        """Xft.dpi 240 at GTK scale 2 reports 120 dpi: the page gets 1/1.25 of the window."""
+        self.assertEqual(self._scale(_FakeX11Display(120.0)), 1.25)
+
+    def test_baseline_resolution_leaves_the_size_alone(self):
+        self.assertEqual(self._scale(_FakeX11Display(96.0)), 1.0)
+
+    def test_unset_resolution_leaves_the_size_alone(self):
+        """GDK reports -1 when no resolution is configured."""
+        self.assertEqual(self._scale(_FakeX11Display(-1.0)), 1.0)
+
+    def test_other_backend_leaves_the_size_alone(self):
+        """Wayland scales GTK and WebKit alike."""
+        self.assertEqual(self._scale(MagicMock()), 1.0)
+
+    def test_no_display_leaves_the_size_alone(self):
+        self.assertEqual(self._scale(None), 1.0)
+
+    def test_without_pygobject_leaves_the_size_alone(self):
+        host = PopupHost(MagicMock(), WIDTH)
+        with patch.dict(sys.modules, {'gi': None}):
+            self.assertEqual(host._css_scale(), 1.0)
+
+
+class TestScaledGeometry(unittest.TestCase):
+    """Tests for sizing and anchoring the window at a fractional scale."""
+
+    def _scaled_host(self):
+        window = MagicMock()
+        host, gtk_window = _host(window)
+        host._css_scale = lambda: 1.25
+
+        return host, window
+
+    def test_resize_covers_the_scaled_content(self):
+        host, window = self._scaled_host()
+        host.apply_geometry(400, keep_position=True)
+        window.resize.assert_called_once_with(round(WIDTH * 1.25), 500)
+
+    def test_anchor_uses_the_scaled_width(self):
+        """The window is wider than the content, so the corner offset must follow."""
+        host, _window = self._scaled_host()
+        host.apply_geometry(400, keep_position=True)
+
+        with patch.object(host, '_primary_monitor', return_value=_monitor(work_x=0, work_y=32, work_width=1920)):
+            self.assertEqual(host._anchor(), (1920 - round(WIDTH * 1.25) - _MARGIN, 32 + _MARGIN))
+
+    def test_end_drag_keeps_the_scaled_height(self):
+        host, _window = self._scaled_host()
+        host.apply_geometry(400, keep_position=True)
+        host.end_drag(400)
+        self.assertEqual(host._height, 500)
 
 
 class TestDismissWatch(unittest.TestCase):

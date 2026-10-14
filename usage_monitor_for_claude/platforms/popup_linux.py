@@ -34,6 +34,8 @@ WINDOW_KWARGS = {'resizable': True}
 
 _MARGIN = 8
 
+_BASELINE_DPI = 96
+
 # Seconds between safety-net checks in the dismiss watch; see watch_dismiss().
 _WATCH_HEARTBEAT = 2.0
 
@@ -58,6 +60,7 @@ class PopupHost:
         self._window = window
         self._width = width
         self._height = 0
+        self._scale = 1.0
         self._keep_position = False
         self._dismissed = threading.Event()
         self._should_dismiss: Callable[[], bool] = lambda: False
@@ -85,9 +88,10 @@ class PopupHost:
         :meth:`reveal`, because a move on an unmapped window is discarded;
         once the window is mapped, the move is applied immediately.
         """
-        self._height = height
+        self._scale = self._css_scale()
+        self._height = round(height * self._scale)
         self._keep_position = keep_position
-        self._window.resize(self._width, height)
+        self._window.resize(round(self._width * self._scale), self._height)
 
         if not keep_position:
             self._on_main_loop(self._move_to_anchor)
@@ -154,7 +158,7 @@ class PopupHost:
         Windows host there is no cross-monitor DPI correction to make.
         """
         self._dragging = False
-        self._height = height
+        self._height = round(height * self._scale)
 
     def _reveal_on_main_loop(self, gtk_window: Any) -> None:
         """Map, position and focus the window.  Runs on the GTK main loop."""
@@ -205,7 +209,7 @@ class PopupHost:
 
         work = monitor.get_workarea()
 
-        return work.x + work.width - self._width - _MARGIN, work.y + _MARGIN
+        return work.x + work.width - round(self._width * self._scale) - _MARGIN, work.y + _MARGIN
 
     def _connect_dismiss_signals(self, gtk_window: Any) -> None:
         """Wire the dismissal signals.  Runs on the GTK main loop."""
@@ -251,6 +255,31 @@ class PopupHost:
             return BrowserView.instances[self._window.uid].window
         except Exception:
             return None
+
+    def _css_scale(self) -> float:
+        """Return how many window pixels one CSS pixel of the popup needs.
+
+        On X11 WebKit takes its device scale from the screen resolution, GTK
+        only from the integer scale factor.  At a fractional scale such as 250%
+        (``Xft.dpi`` 240, GTK scale 2) the page therefore gets 2/2.5 of the
+        window in each direction, and a window sized to the content cuts the
+        bottom off.  Other backends scale both sides alike.
+        """
+        try:
+            import gi
+
+            gi.require_version('GdkX11', '3.0')
+            from gi.repository import GdkX11
+
+            display = self._display()
+            if not isinstance(display, GdkX11.X11Display):
+                return 1.0
+
+            resolution = display.get_default_screen().get_resolution()
+        except (ImportError, ValueError, AttributeError):
+            return 1.0
+
+        return resolution / _BASELINE_DPI if resolution > 0 else 1.0
 
     def _display(self) -> Any:
         """Return the default Gdk display, or None without a session."""

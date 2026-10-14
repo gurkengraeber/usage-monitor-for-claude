@@ -34,6 +34,7 @@ Prioritize readability and auditability - users handle credentials and must be a
   - **No GTK signal handler may call a blocking pywebview API.** Handlers run on the main loop, and pywebview waits for that same loop - the whole session deadlocks. `_on_loaded` therefore hands off to a worker thread
 - `resizable=True` is mandatory: GTK ignores `resize()` on a non-resizable window, so the content-driven height would never apply. WebKitGTK also needs a real `file://` URI - handed a bare path it stays on `about:blank` and the injected `init()` fails with a ReferenceError. Both live in the host's `WINDOW_KWARGS` and `popup_url()`
 - Dismissal is `focus-out-event` plus `key-press-event`, not global hooks - Wayland has no equivalent of `WH_MOUSE_LL`, and none is needed once the window holds focus
+- The window is sized to `CSS size x screen resolution / 96` (`_css_scale()`), X11 only. WebKit takes its device scale from the screen resolution while GTK uses the integer scale factor, so at 250% (`Xft.dpi` 240, GTK scale 2) the page gets 2/2.5 of the window in both directions and a window sized to the content cuts the bottom off
 - There is no DPI arithmetic: GTK reports and consumes logical pixels on both sides
 - StatusNotifierItem never reports where the panel drew the icon - no protocol carries that - so the popup anchors to the work-area corner instead of the icon
 
