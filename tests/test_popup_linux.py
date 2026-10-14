@@ -244,6 +244,60 @@ class TestDismissWatch(unittest.TestCase):
         thread.join(timeout=2)
         self.assertFalse(thread.is_alive())
 
+    def _focus_out_in_settle(self, should_dismiss=True):
+        """Deliver a focus-out inside the settle period; return the host, window and the scheduled check."""
+        host, gtk_window = _host()
+        host._should_dismiss = lambda: should_dismiss
+        fake_glib = MagicMock()
+        with patch('usage_monitor_for_claude.platforms.popup_linux.time.monotonic', return_value=100.0), \
+             patch.dict(sys.modules, {'gi.repository': MagicMock(GLib=fake_glib)}):
+            host._focus_settled_at = 100.0 + _FOCUS_SETTLE_SECONDS
+            host._on_focus_out(gtk_window)
+
+        return host, gtk_window, fake_glib
+
+    def test_focus_out_in_the_settle_period_schedules_a_recheck(self):
+        """The recheck fires just after the period, so a user who clicked away at once is not left with an open popup."""
+        _host_, _gtk_window, fake_glib = self._focus_out_in_settle()
+        delay, _check = fake_glib.timeout_add.call_args.args
+        self.assertEqual(delay, round(_FOCUS_SETTLE_SECONDS * 1000) + 50)
+
+    def test_recheck_dismisses_a_window_that_still_has_no_focus(self):
+        host, gtk_window, fake_glib = self._focus_out_in_settle()
+        gtk_window.has_toplevel_focus.return_value = False
+        fake_glib.timeout_add.call_args.args[1]()
+        self.assertTrue(host._dismissed.is_set())
+
+    def test_recheck_keeps_a_window_that_regained_focus(self):
+        """The compositor's focus-out for a freshly mapped window is followed by the focus coming back."""
+        host, gtk_window, fake_glib = self._focus_out_in_settle()
+        gtk_window.has_toplevel_focus.return_value = True
+        fake_glib.timeout_add.call_args.args[1]()
+        self.assertFalse(host._dismissed.is_set())
+
+    def test_recheck_keeps_a_pinned_popup(self):
+        host, gtk_window, fake_glib = self._focus_out_in_settle(should_dismiss=False)
+        gtk_window.has_toplevel_focus.return_value = False
+        fake_glib.timeout_add.call_args.args[1]()
+        self.assertFalse(host._dismissed.is_set())
+
+    def test_recheck_of_an_earlier_opening_is_ignored(self):
+        """A check left over from the previous opening must not close the popup that replaced it."""
+        host, gtk_window, fake_glib = self._focus_out_in_settle()
+        gtk_window.has_toplevel_focus.return_value = False
+        host._reveal_count += 1
+        fake_glib.timeout_add.call_args.args[1]()
+        self.assertFalse(host._dismissed.is_set())
+
+    def test_focus_out_without_a_window_schedules_nothing(self):
+        host, _gtk_window = _host()
+        fake_glib = MagicMock()
+        with patch('usage_monitor_for_claude.platforms.popup_linux.time.monotonic', return_value=100.0), \
+             patch.dict(sys.modules, {'gi.repository': MagicMock(GLib=fake_glib)}):
+            host._focus_settled_at = 100.0 + _FOCUS_SETTLE_SECONDS
+            host._on_focus_out()
+        fake_glib.timeout_add.assert_not_called()
+
     def test_reveal_starts_the_settle_period(self):
         """Every opening gets its own grace period, not only the first."""
         host, _gtk_window = _host()

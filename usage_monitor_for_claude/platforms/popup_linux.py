@@ -78,6 +78,7 @@ class PopupHost:
         self._dragging = False
         self._signals_connected = False
         self._focus_settled_at = 0.0
+        self._reveal_count = 0
 
     def prepare(self) -> None:
         """Put the window on screen but fully transparent.
@@ -92,6 +93,7 @@ class PopupHost:
     def reveal(self) -> None:
         """Map, position, focus and finally show the prepared window."""
         self._focus_settled_at = time.monotonic() + _FOCUS_SETTLE_SECONDS
+        self._reveal_count += 1
         self._on_main_loop(self._reveal_on_main_loop)
 
     def hide(self) -> None:
@@ -241,14 +243,43 @@ class PopupHost:
         gtk_window.connect('focus-out-event', self._on_focus_out)
         gtk_window.connect('key-press-event', self._on_key_press)
 
-    def _on_focus_out(self, *_args: object) -> bool:
-        if time.monotonic() < self._focus_settled_at:
+    def _on_focus_out(self, gtk_window: Any = None, *_args: object) -> bool:
+        remaining = self._focus_settled_at - time.monotonic()
+        if remaining > 0:
+            self._recheck_focus_after(gtk_window, remaining)
+
             return False
 
         if self._should_dismiss():
             self._dismissed.set()
 
         return False
+
+    def _recheck_focus_after(self, gtk_window: Any, delay: float) -> None:
+        """Dismiss once the settle period is over if the window still has no focus.
+
+        A focus-out inside the period is usually the compositor settling, but it
+        can also be the user clicking away at once, and ignoring that would leave
+        the popup open without a way to dismiss it.  Runs on the GTK main loop.
+        """
+        if gtk_window is None:
+            return
+
+        try:
+            from gi.repository import GLib
+        except ImportError:
+            return
+
+        reveal_count = self._reveal_count
+
+        def check() -> bool:
+            # A later opening has its own period and its own check.
+            if reveal_count == self._reveal_count and not gtk_window.has_toplevel_focus() and self._should_dismiss():
+                self._dismissed.set()
+
+            return False
+
+        GLib.timeout_add(round(delay * 1000) + 50, check)
 
     def _on_key_press(self, _widget: Any, event: Any) -> bool:
         if getattr(event, 'keyval', None) == _KEY_ESCAPE and self._should_dismiss():
