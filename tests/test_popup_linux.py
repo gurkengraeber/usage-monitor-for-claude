@@ -18,7 +18,7 @@ if sys.platform == 'win32':
     raise unittest.SkipTest('GTK popup host is not used on Windows')
 
 from usage_monitor_for_claude.platforms.popup_linux import (  # noqa: E402
-    _KEY_ESCAPE, _MARGIN, WINDOW_KWARGS, PopupHost, popup_url,
+    _FOCUS_SETTLE_SECONDS, _KEY_ESCAPE, _MARGIN, _ZOOM_THRESHOLD, REUSE_WINDOW, WINDOW_KWARGS, PopupHost, popup_url,
 )
 
 WIDTH = 340
@@ -35,11 +35,21 @@ def _host(window=None, gtk_window=None):
     return host, gtk_window
 
 
-def _monitor(work_x=2560, work_y=32, work_width=3440, work_height=1357):
+def _monitor(work_x=2560, work_y=32, work_width=3440, work_height=1357, monitor_y=0, monitor_height=None):
+    """Build a monitor; without *monitor_height* the work area reaches the monitor's bottom edge."""
+    if monitor_height is None:
+        monitor_height = work_y - monitor_y + work_height
+
     monitor = MagicMock()
     monitor.get_workarea.return_value = MagicMock(x=work_x, y=work_y, width=work_width, height=work_height)
+    monitor.get_geometry.return_value = MagicMock(y=monitor_y, height=monitor_height)
 
     return monitor
+
+
+def _bottom_panel_monitor():
+    """A monitor whose only panel reserves 48 pixels at the bottom edge."""
+    return _monitor(work_y=0, work_height=1032, monitor_height=1080)
 
 
 class TestWindowOptions(unittest.TestCase):
@@ -63,10 +73,59 @@ class TestAnchor(unittest.TestCase):
         with patch.object(host, '_primary_monitor', return_value=_monitor()):
             self.assertEqual(host._anchor(), (2560 + 3440 - WIDTH - _MARGIN, 32 + _MARGIN))
 
+    def test_anchors_to_bottom_right_above_a_bottom_panel(self):
+        """Space reserved at the bottom and none at the top puts the tray in the bottom corner."""
+        host, _ = _host()
+        host._height = 472
+        with patch.object(host, '_primary_monitor', return_value=_bottom_panel_monitor()):
+            self.assertEqual(host._anchor(), (2560 + 3440 - WIDTH - _MARGIN, 1032 - 472 - _MARGIN))
+
+    def test_offset_monitor_with_bottom_panel_anchors_to_bottom(self):
+        """The work area is compared against the monitor's own edges, not against zero."""
+        host, _ = _host()
+        host._height = 472
+        monitor = _monitor(work_y=300, work_height=1032, monitor_y=300, monitor_height=1080)
+        with patch.object(host, '_primary_monitor', return_value=monitor):
+            _x, y = host._anchor()
+        self.assertEqual(y, 300 + 1032 - 472 - _MARGIN)
+
+    def test_offset_monitor_with_top_panel_anchors_to_top(self):
+        """A top panel is recognized on a monitor that does not start at the root origin."""
+        host, _ = _host()
+        host._height = 472
+        with patch.object(host, '_primary_monitor', return_value=_monitor(work_y=332, monitor_y=300)):
+            _x, y = host._anchor()
+        self.assertEqual(y, 332 + _MARGIN)
+
+    def test_work_area_equal_to_the_monitor_keeps_the_top_corner(self):
+        """A fullscreen window, an auto-hiding panel and a missing primary monitor all report no reserved space."""
+        host, _ = _host()
+        host._height = 472
+        with patch.object(host, '_primary_monitor', return_value=_monitor(work_y=0, work_height=1080)):
+            _x, y = host._anchor()
+        self.assertEqual(y, _MARGIN)
+
+    def test_side_panel_only_keeps_the_top_corner(self):
+        """A panel on the left or right edge says nothing about top or bottom."""
+        host, _ = _host()
+        host._height = 472
+        monitor = _monitor(work_x=2560 + 64, work_y=0, work_width=3440 - 64, work_height=1080)
+        with patch.object(host, '_primary_monitor', return_value=monitor):
+            self.assertEqual(host._anchor(), (2560 + 3440 - WIDTH - _MARGIN, _MARGIN))
+
+    def test_top_and_bottom_panels_keep_the_top_corner(self):
+        """With a panel on both edges the tray sits in the top one."""
+        host, _ = _host()
+        host._height = 472
+        monitor = _monitor(work_y=32, work_height=1000, monitor_height=1080)
+        with patch.object(host, '_primary_monitor', return_value=monitor):
+            _x, y = host._anchor()
+        self.assertEqual(y, 32 + _MARGIN)
+
     def test_anchor_uses_absolute_coordinates(self):
         """Gtk.Window.move() takes root coordinates, so the monitor origin is included."""
         host, _ = _host()
-        with patch.object(host, '_primary_monitor', return_value=_monitor(work_x=0, work_y=0)):
+        with patch.object(host, '_primary_monitor', return_value=_monitor(work_x=0)):
             x, _y = host._anchor()
         self.assertEqual(x, 3440 - WIDTH - _MARGIN)
 
@@ -97,6 +156,15 @@ class TestPrepareAndReveal(unittest.TestCase):
         order = [name for name, _args, _kwargs in gtk_window.method_calls]
         self.assertLess(order.index('show_all'), order.index('move'))
         self.assertLess(order.index('present'), order.index('move'))
+
+    def test_reveal_positions_a_bottom_anchored_popup_with_its_height(self):
+        """Without the height from apply_geometry() the popup's top edge would land on the panel."""
+        host, gtk_window = _host()
+        with patch.object(host, '_primary_monitor', return_value=_bottom_panel_monitor()):
+            host.apply_geometry(472, keep_position=False)
+            host.reveal()
+
+        self.assertEqual(gtk_window.move.call_args_list[-1].args, (2560 + 3440 - WIDTH - _MARGIN, 1032 - 472 - _MARGIN))
 
     def test_reveal_forces_focus(self):
         """Without focus the window can never emit focus-out, so it could never dismiss."""
@@ -135,7 +203,7 @@ class TestApplyGeometry(unittest.TestCase):
     """Tests for resizing and repositioning."""
 
     def test_resize_uses_logical_pixels(self):
-        """GTK reports and consumes logical pixels, so no DPI arithmetic is needed."""
+        """GTK reports and consumes logical pixels, so at 96 dpi the window takes the CSS size as is."""
         window = MagicMock()
         host, _ = _host(window)
         with patch.object(host, '_primary_monitor', return_value=_monitor()):
@@ -149,6 +217,13 @@ class TestApplyGeometry(unittest.TestCase):
             host.apply_geometry(565, keep_position=False)
         gtk_window.move.assert_called_once_with(2560 + 3440 - WIDTH - _MARGIN, 32 + _MARGIN)
 
+    def test_bottom_anchor_follows_the_new_height(self):
+        """Above a bottom panel a taller popup has to move up, or it would grow over the panel."""
+        host, gtk_window = _host()
+        with patch.object(host, '_primary_monitor', return_value=_bottom_panel_monitor()):
+            host.apply_geometry(565, keep_position=False)
+        gtk_window.move.assert_called_once_with(2560 + 3440 - WIDTH - _MARGIN, 1032 - 565 - _MARGIN)
+
     def test_kept_position_resizes_without_moving(self):
         """A moved pinned popup keeps its position when the content height changes."""
         window = MagicMock()
@@ -158,52 +233,61 @@ class TestApplyGeometry(unittest.TestCase):
         gtk_window.move.assert_not_called()
 
 
-class _FakeX11Display:
-    """Stands in for ``GdkX11.X11Display``, reporting a fixed screen resolution."""
+def _display_with_resolution(resolution):
+    """Build a Gdk display whose default screen reports *resolution* dpi."""
+    display = MagicMock()
+    display.get_default_screen.return_value.get_resolution.return_value = resolution
 
-    def __init__(self, resolution):
-        self._resolution = resolution
-
-    def get_default_screen(self):
-        return MagicMock(get_resolution=lambda: self._resolution)
+    return display
 
 
 class TestCssScale(unittest.TestCase):
-    """Tests for matching the window size to WebKit's device scale.
+    """Tests for matching the window size to WebKit's page zoom.
 
-    At a fractional scale GTK uses an integer factor while WebKit uses the
-    screen resolution, so the page would get less than the whole window.
+    WebKitGTK zooms the page by the font resolution over 96 dpi while GTK
+    scales the window only by an integer factor, so a window sized to the
+    content in CSS pixels would give the page less than it needs.
     """
 
     def _scale(self, display):
         host = PopupHost(MagicMock(), WIDTH)
-        fake_gdkx11 = MagicMock(X11Display=_FakeX11Display)
-        with patch.dict(sys.modules, {'gi': MagicMock(), 'gi.repository': MagicMock(GdkX11=fake_gdkx11)}), \
-             patch.object(host, '_display', return_value=display):
+        with patch.object(host, '_display', return_value=display):
             return host._css_scale()
 
     def test_fractional_scale_enlarges_the_window(self):
         """Xft.dpi 240 at GTK scale 2 reports 120 dpi: the page gets 1/1.25 of the window."""
-        self.assertEqual(self._scale(_FakeX11Display(120.0)), 1.25)
+        self.assertEqual(self._scale(_display_with_resolution(120.0)), 1.25)
+
+    def test_any_backend_follows_the_resolution(self):
+        """WebKit zooms on every backend, so a Wayland text scaling factor of 1.5 counts too."""
+        self.assertEqual(self._scale(_display_with_resolution(144.0)), 1.5)
 
     def test_baseline_resolution_leaves_the_size_alone(self):
-        self.assertEqual(self._scale(_FakeX11Display(96.0)), 1.0)
+        self.assertEqual(self._scale(_display_with_resolution(96.0)), 1.0)
 
     def test_unset_resolution_leaves_the_size_alone(self):
         """GDK reports -1 when no resolution is configured."""
-        self.assertEqual(self._scale(_FakeX11Display(-1.0)), 1.0)
-
-    def test_other_backend_leaves_the_size_alone(self):
-        """Wayland scales GTK and WebKit alike."""
-        self.assertEqual(self._scale(MagicMock()), 1.0)
+        self.assertEqual(self._scale(_display_with_resolution(-1.0)), 1.0)
 
     def test_no_display_leaves_the_size_alone(self):
         self.assertEqual(self._scale(None), 1.0)
 
     def test_without_pygobject_leaves_the_size_alone(self):
+        """The real ``_display()`` returns None when ``gi`` cannot be imported."""
         host = PopupHost(MagicMock(), WIDTH)
         with patch.dict(sys.modules, {'gi': None}):
             self.assertEqual(host._css_scale(), 1.0)
+
+    def test_deviation_within_the_threshold_leaves_the_size_alone(self):
+        """WebKit keeps the zoom at 1.0 up to a 2% deviation, so the window must not grow either."""
+        for resolution in (96 * (1 - _ZOOM_THRESHOLD) + 0.1, 97.0, 96 * (1 + _ZOOM_THRESHOLD) - 0.1):
+            with self.subTest(resolution=resolution):
+                self.assertEqual(self._scale(_display_with_resolution(resolution)), 1.0)
+
+    def test_deviation_beyond_the_threshold_scales(self):
+        for resolution in (93.0, 98.0):
+            with self.subTest(resolution=resolution):
+                self.assertEqual(self._scale(_display_with_resolution(resolution)), resolution / 96)
 
 
 class TestScaledGeometry(unittest.TestCase):
@@ -228,6 +312,26 @@ class TestScaledGeometry(unittest.TestCase):
 
         with patch.object(host, '_primary_monitor', return_value=_monitor(work_x=0, work_y=32, work_width=1920)):
             self.assertEqual(host._anchor(), (1920 - round(WIDTH * 1.25) - _MARGIN, 32 + _MARGIN))
+
+    def test_bottom_anchor_uses_the_scaled_height(self):
+        """Above a bottom panel the window is taller than the content, so it has to sit higher."""
+        host, _window = self._scaled_host()
+        host.apply_geometry(400, keep_position=True)
+
+        with patch.object(host, '_primary_monitor', return_value=_bottom_panel_monitor()):
+            self.assertEqual(host._anchor(), (2560 + 3440 - round(WIDTH * 1.25) - _MARGIN, 1032 - 500 - _MARGIN))
+
+    def test_move_after_resize_uses_the_scaled_size(self):
+        """An unpinned popup is moved right after the resize, with the size the resize applied."""
+        window = MagicMock()
+        host, gtk_window = _host(window)
+        host._css_scale = lambda: 1.25
+
+        with patch.object(host, '_primary_monitor', return_value=_bottom_panel_monitor()):
+            host.apply_geometry(400, keep_position=False)
+
+        window.resize.assert_called_once_with(round(WIDTH * 1.25), 500)
+        gtk_window.move.assert_called_once_with(2560 + 3440 - round(WIDTH * 1.25) - _MARGIN, 1032 - 500 - _MARGIN)
 
     def test_end_drag_keeps_the_scaled_height(self):
         host, _window = self._scaled_host()
@@ -304,6 +408,117 @@ class TestDismissWatch(unittest.TestCase):
         host, _gtk_window, _thread = self._watching(lambda: True)
         self.assertFalse(host._on_focus_out())
         self.assertFalse(host._on_key_press(None, MagicMock(keyval=_KEY_ESCAPE)))
+
+    def test_focus_out_right_after_the_reveal_is_ignored(self):
+        """The compositor reports one for a window it has just mapped; that is not the user leaving."""
+        host, _gtk_window, thread = self._watching(lambda: True)
+        with patch('usage_monitor_for_claude.platforms.popup_linux.time.monotonic', return_value=100.0):
+            host._focus_settled_at = 100.0 + _FOCUS_SETTLE_SECONDS
+            host._on_focus_out()
+        thread.join(timeout=0.5)
+        self.assertTrue(thread.is_alive())
+
+    def test_focus_out_after_the_settle_period_dismisses(self):
+        """Once the window has settled, losing focus closes an unpinned popup again."""
+        host, _gtk_window, thread = self._watching(lambda: True)
+        with patch('usage_monitor_for_claude.platforms.popup_linux.time.monotonic', return_value=100.0):
+            host._focus_settled_at = 100.0
+            host._on_focus_out()
+        thread.join(timeout=2)
+        self.assertFalse(thread.is_alive())
+
+    def _focus_out_in_settle(self, should_dismiss=True):
+        """Deliver a focus-out inside the settle period; return the host, window and the scheduled check."""
+        host, gtk_window = _host()
+        host._should_dismiss = lambda: should_dismiss
+        fake_glib = MagicMock()
+        with patch('usage_monitor_for_claude.platforms.popup_linux.time.monotonic', return_value=100.0), \
+             patch.dict(sys.modules, {'gi.repository': MagicMock(GLib=fake_glib)}):
+            host._focus_settled_at = 100.0 + _FOCUS_SETTLE_SECONDS
+            host._on_focus_out(gtk_window)
+
+        return host, gtk_window, fake_glib
+
+    def test_focus_out_in_the_settle_period_schedules_a_recheck(self):
+        """The recheck fires just after the period, so a user who clicked away at once is not left with an open popup."""
+        _host_, _gtk_window, fake_glib = self._focus_out_in_settle()
+        delay, _check = fake_glib.timeout_add.call_args.args
+        self.assertEqual(delay, round(_FOCUS_SETTLE_SECONDS * 1000) + 50)
+
+    def test_recheck_dismisses_a_window_that_still_has_no_focus(self):
+        host, gtk_window, fake_glib = self._focus_out_in_settle()
+        gtk_window.has_toplevel_focus.return_value = False
+        fake_glib.timeout_add.call_args.args[1]()
+        self.assertTrue(host._dismissed.is_set())
+
+    def test_recheck_keeps_a_window_that_regained_focus(self):
+        """The compositor's focus-out for a freshly mapped window is followed by the focus coming back."""
+        host, gtk_window, fake_glib = self._focus_out_in_settle()
+        gtk_window.has_toplevel_focus.return_value = True
+        fake_glib.timeout_add.call_args.args[1]()
+        self.assertFalse(host._dismissed.is_set())
+
+    def test_recheck_keeps_a_pinned_popup(self):
+        host, gtk_window, fake_glib = self._focus_out_in_settle(should_dismiss=False)
+        gtk_window.has_toplevel_focus.return_value = False
+        fake_glib.timeout_add.call_args.args[1]()
+        self.assertFalse(host._dismissed.is_set())
+
+    def test_recheck_of_an_earlier_opening_is_ignored(self):
+        """A check left over from the previous opening must not close the popup that replaced it."""
+        host, gtk_window, fake_glib = self._focus_out_in_settle()
+        gtk_window.has_toplevel_focus.return_value = False
+        host._reveal_count += 1
+        fake_glib.timeout_add.call_args.args[1]()
+        self.assertFalse(host._dismissed.is_set())
+
+    def test_focus_out_without_a_window_schedules_nothing(self):
+        host, _gtk_window = _host()
+        fake_glib = MagicMock()
+        with patch('usage_monitor_for_claude.platforms.popup_linux.time.monotonic', return_value=100.0), \
+             patch.dict(sys.modules, {'gi.repository': MagicMock(GLib=fake_glib)}):
+            host._focus_settled_at = 100.0 + _FOCUS_SETTLE_SECONDS
+            host._on_focus_out()
+        fake_glib.timeout_add.assert_not_called()
+
+    def test_reveal_starts_the_settle_period(self):
+        """Every opening gets its own grace period, not only the first."""
+        host, _gtk_window = _host()
+        with patch.object(host, '_anchor', return_value=None), \
+             patch('usage_monitor_for_claude.platforms.popup_linux.time.monotonic', return_value=50.0):
+            host.reveal()
+        self.assertEqual(host._focus_settled_at, 50.0 + _FOCUS_SETTLE_SECONDS)
+
+    def test_signals_are_connected_once_across_watches(self):
+        """The window is kept between openings, so a second watch must not stack handlers."""
+        host, gtk_window = _host()
+        host._connect_dismiss_signals(gtk_window)
+        host._connect_dismiss_signals(gtk_window)
+        connects = [name for name, _args, _kwargs in gtk_window.method_calls if name == 'connect']
+        self.assertEqual(len(connects), 2)
+
+
+class TestHide(unittest.TestCase):
+    """Tests for taking the popup off screen without destroying its window."""
+
+    def test_hide_hides_the_gtk_window(self):
+        """The window stays alive; it is only unmapped."""
+        window = MagicMock()
+        host, gtk_window = _host(window)
+        host.hide()
+        gtk_window.hide.assert_called_once()
+        window.destroy.assert_not_called()
+
+    def test_hide_ends_a_drag_in_progress(self):
+        """A drag left over from the previous opening must not carry into the next."""
+        host, _gtk_window = _host()
+        host._dragging = True
+        host.hide()
+        self.assertFalse(host._dragging)
+
+    def test_this_platform_reuses_its_window(self):
+        """GTK leaves a web and network process behind for every destroyed window."""
+        self.assertTrue(REUSE_WINDOW)
 
 
 class TestDrag(unittest.TestCase):

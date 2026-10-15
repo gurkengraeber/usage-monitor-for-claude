@@ -23,24 +23,41 @@ when violated - every pywebview call still reports success:
 from __future__ import annotations
 
 import threading
+import time
 from typing import Any, Callable
 
-__all__ = ['WINDOW_KWARGS', 'PopupHost', 'popup_url']
+__all__ = ['REUSE_WINDOW', 'WINDOW_KWARGS', 'PopupHost', 'popup_url']
 
 # Extra ``webview.create_window`` options for this platform.  GTK ignores
 # ``resize()`` on a non-resizable window, so the content-driven height would
 # never be applied; a frameless window has no visible grips to drag anyway.
 WINDOW_KWARGS = {'resizable': True}
 
+# Whether one popup window is kept and reloaded for every opening.  On GTK
+# every pywebview window starts its own WebKit web and network process, and
+# ``destroy()`` does not stop them, so each destroyed window would hold about
+# 200 MB until the app quits.  See :class:`~usage_monitor_for_claude.popup.PopupWindowCache`.
+REUSE_WINDOW = True
+
 _MARGIN = 8
 
 _BASELINE_DPI = 96
+
+# Relative deviation from _BASELINE_DPI below which WebKitGTK leaves the page
+# zoom at 1.0; see _css_scale().
+_ZOOM_THRESHOLD = 0.02
 
 # Seconds between safety-net checks in the dismiss watch; see watch_dismiss().
 _WATCH_HEARTBEAT = 2.0
 
 # Escape, as reported by Gdk key events.
 _KEY_ESCAPE = 0xFF1B
+
+# Seconds after the reveal during which a focus-out is not a dismissal.  The
+# compositor reports one for a window it has just mapped; whether it lands
+# before or after the reveal depends on how quickly the page answered, and a
+# popup shown again answers quickly enough to lose that race.
+_FOCUS_SETTLE_SECONDS = 0.5
 
 
 def popup_url(path: Any) -> str:
@@ -66,6 +83,9 @@ class PopupHost:
         self._should_dismiss: Callable[[], bool] = lambda: False
         self._drag_offset = (0, 0)
         self._dragging = False
+        self._signals_connected = False
+        self._focus_settled_at = 0.0
+        self._reveal_count = 0
 
     def prepare(self) -> None:
         """Put the window on screen but fully transparent.
@@ -79,14 +99,22 @@ class PopupHost:
 
     def reveal(self) -> None:
         """Map, position, focus and finally show the prepared window."""
+        self._focus_settled_at = time.monotonic() + _FOCUS_SETTLE_SECONDS
+        self._reveal_count += 1
         self._on_main_loop(self._reveal_on_main_loop)
+
+    def hide(self) -> None:
+        """Take the popup off screen but keep its window for the next opening."""
+        self._dragging = False
+        self._on_main_loop(lambda gtk_window: gtk_window.hide())
 
     def apply_geometry(self, height: int, *, keep_position: bool) -> None:
         """Resize to *height* and remember whether the anchor still applies.
 
-        Only the resize happens here.  Positioning is deferred to
-        :meth:`reveal`, because a move on an unmapped window is discarded;
-        once the window is mapped, the move is applied immediately.
+        *height* is in CSS pixels; the window gets the content size times
+        :meth:`_css_scale`.  Only the resize happens here.  Positioning is
+        deferred to :meth:`reveal`, because a move on an unmapped window is
+        discarded; once the window is mapped, the move is applied immediately.
         """
         self._scale = self._css_scale()
         self._height = round(height * self._scale)
@@ -201,26 +229,77 @@ class PopupHost:
 
         StatusNotifierItem never reports where the panel drew the icon - no
         protocol carries that - so the popup anchors to the work-area corner
-        the icon sits in.
+        the icon sits in.  That is the top corner unless the work area gives
+        positive evidence of a bottom panel: no space reserved at the top and
+        space reserved at the bottom.  A work area equal to the monitor
+        geometry says nothing about the panel - a fullscreen window, an
+        auto-hiding panel and a missing primary monitor all look like that -
+        and neither does a side panel, so those keep the top corner.
         """
         monitor = self._primary_monitor()
         if monitor is None:
             return None
 
         work = monitor.get_workarea()
+        geometry = monitor.get_geometry()
+        x = work.x + work.width - round(self._width * self._scale) - _MARGIN
 
-        return work.x + work.width - round(self._width * self._scale) - _MARGIN, work.y + _MARGIN
+        bottom_panel = work.y == geometry.y and work.y + work.height < geometry.y + geometry.height
+        if bottom_panel:
+            return x, work.y + work.height - self._height - _MARGIN
+
+        return x, work.y + _MARGIN
 
     def _connect_dismiss_signals(self, gtk_window: Any) -> None:
-        """Wire the dismissal signals.  Runs on the GTK main loop."""
+        """Wire the dismissal signals once.  Runs on the GTK main loop.
+
+        The window outlives a single opening, so later watches reuse the
+        handlers; connecting again would stack one more per opening.
+        """
+        if self._signals_connected:
+            return
+
+        self._signals_connected = True
         gtk_window.connect('focus-out-event', self._on_focus_out)
         gtk_window.connect('key-press-event', self._on_key_press)
 
-    def _on_focus_out(self, *_args: object) -> bool:
+    def _on_focus_out(self, gtk_window: Any = None, *_args: object) -> bool:
+        remaining = self._focus_settled_at - time.monotonic()
+        if remaining > 0:
+            self._recheck_focus_after(gtk_window, remaining)
+
+            return False
+
         if self._should_dismiss():
             self._dismissed.set()
 
         return False
+
+    def _recheck_focus_after(self, gtk_window: Any, delay: float) -> None:
+        """Dismiss once the settle period is over if the window still has no focus.
+
+        A focus-out inside the period is usually the compositor settling, but it
+        can also be the user clicking away at once, and ignoring that would leave
+        the popup open without a way to dismiss it.  Runs on the GTK main loop.
+        """
+        if gtk_window is None:
+            return
+
+        try:
+            from gi.repository import GLib
+        except ImportError:
+            return
+
+        reveal_count = self._reveal_count
+
+        def check() -> bool:
+            # A later opening has its own period and its own check.
+            if reveal_count == self._reveal_count and not gtk_window.has_toplevel_focus() and self._should_dismiss():
+                self._dismissed.set()
+
+            return False
+
+        GLib.timeout_add(round(delay * 1000) + 50, check)
 
     def _on_key_press(self, _widget: Any, event: Any) -> bool:
         if getattr(event, 'keyval', None) == _KEY_ESCAPE and self._should_dismiss():
@@ -259,27 +338,32 @@ class PopupHost:
     def _css_scale(self) -> float:
         """Return how many window pixels one CSS pixel of the popup needs.
 
-        On X11 WebKit takes its device scale from the screen resolution, GTK
-        only from the integer scale factor.  At a fractional scale such as 250%
-        (``Xft.dpi`` 240, GTK scale 2) the page therefore gets 2/2.5 of the
-        window in each direction, and a window sized to the content cuts the
-        bottom off.  Other backends scale both sides alike.
+        WebKitGTK zooms every page by the font resolution over 96 dpi
+        (``refreshInternalScaling()`` in ``WebKitWebViewBase.cpp``), while GTK
+        scales the window only by its integer scale factor.  At 250% on X11
+        (``Xft.dpi`` 240, GTK scale 2) GDK reports 120 dpi, the page is zoomed
+        by 1.25 on top of the scale factor, and a window sized to the content
+        would cut its bottom off.  A text scaling factor has the same effect,
+        on every backend.
+
+        On GTK 3 WebKit reads the resolution through the same
+        ``gdk_screen_get_resolution()`` call, and it keeps the zoom at 1.0 for
+        a resolution within ``_ZOOM_THRESHOLD`` of 96 dpi, so this does too.
         """
-        try:
-            import gi
-
-            gi.require_version('GdkX11', '3.0')
-            from gi.repository import GdkX11
-
-            display = self._display()
-            if not isinstance(display, GdkX11.X11Display):
-                return 1.0
-
-            resolution = display.get_default_screen().get_resolution()
-        except (ImportError, ValueError, AttributeError):
+        display = self._display()
+        if display is None:
             return 1.0
 
-        return resolution / _BASELINE_DPI if resolution > 0 else 1.0
+        # GDK reports -1 when no resolution is configured.
+        resolution = display.get_default_screen().get_resolution()
+        if resolution <= 0:
+            return 1.0
+
+        scale = resolution / _BASELINE_DPI
+        if abs(scale - 1) <= _ZOOM_THRESHOLD:
+            return 1.0
+
+        return scale
 
     def _display(self) -> Any:
         """Return the default Gdk display, or None without a session."""

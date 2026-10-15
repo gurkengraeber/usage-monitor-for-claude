@@ -17,11 +17,15 @@ import ctypes.wintypes
 import threading
 from typing import Any, Callable
 
-__all__ = ['WINDOW_KWARGS', 'PopupHost', 'popup_url']
+__all__ = ['REUSE_WINDOW', 'WINDOW_KWARGS', 'PopupHost', 'popup_url']
 
 # Extra ``webview.create_window`` options for this platform.  A non-resizable
 # window is what keeps the frameless popup from being dragged by its edges.
 WINDOW_KWARGS = {'resizable': False, 'shadow': False}
+
+# Every opening creates and destroys its own window here; only the GTK host
+# can keep one alive between openings.
+REUSE_WINDOW = False
 
 _BASELINE_DPI = 96
 _GWL_EXSTYLE = -20
@@ -39,6 +43,23 @@ _MARGIN = 12
 # bounce WebView2 causes between its host and renderer process on every click
 # inside the content area.
 _FOREGROUND_SETTLE = 0.2
+
+# LRESULT is LONG_PTR: 64-bit on Win64.  A narrower return type leaves the
+# upper half of RAX undefined, and Windows reads any nonzero value from a
+# low-level hook as "consume this input".
+_LRESULT = ctypes.wintypes.LPARAM
+_HOOKPROC = ctypes.WINFUNCTYPE(_LRESULT, ctypes.c_int, ctypes.wintypes.WPARAM, ctypes.wintypes.LPARAM)
+
+# Hook handles are pointer-sized; the default c_int return would truncate them on 64-bit.
+ctypes.windll.user32.SetWindowsHookExW.argtypes = [ctypes.c_int, _HOOKPROC, ctypes.wintypes.HINSTANCE, ctypes.wintypes.DWORD]
+ctypes.windll.user32.SetWindowsHookExW.restype = ctypes.wintypes.HHOOK
+ctypes.windll.user32.UnhookWindowsHookEx.argtypes = [ctypes.wintypes.HHOOK]
+ctypes.windll.user32.UnhookWindowsHookEx.restype = ctypes.wintypes.BOOL
+ctypes.windll.user32.CallNextHookEx.argtypes = [ctypes.wintypes.HHOOK, ctypes.c_int, ctypes.wintypes.WPARAM, ctypes.wintypes.LPARAM]
+ctypes.windll.user32.CallNextHookEx.restype = _LRESULT
+ctypes.windll.user32.SetWinEventHook.restype = ctypes.wintypes.HANDLE
+ctypes.windll.user32.UnhookWinEvent.argtypes = [ctypes.wintypes.HANDLE]
+ctypes.windll.user32.UnhookWinEvent.restype = ctypes.wintypes.BOOL
 
 
 def popup_url(path: Any) -> str:
@@ -139,15 +160,13 @@ class PopupHost:
                 ctypes.windll.user32.PostThreadMessageW(this_thread, _WM_QUIT, 0, 0)
 
         call_next = ctypes.windll.user32.CallNextHookEx
-        call_next.argtypes = [ctypes.wintypes.HANDLE, ctypes.c_int, ctypes.wintypes.WPARAM, ctypes.wintypes.LPARAM]
-        call_next.restype = ctypes.c_long
 
         class MSLLHOOKSTRUCT(ctypes.Structure):
             _fields_ = [('pt', ctypes.wintypes.POINT), ('mouseData', ctypes.wintypes.DWORD),
                         ('flags', ctypes.wintypes.DWORD), ('time', ctypes.wintypes.DWORD),
                         ('dwExtraInfo', ctypes.POINTER(ctypes.c_ulong))]
 
-        @ctypes.WINFUNCTYPE(ctypes.c_long, ctypes.c_int, ctypes.wintypes.WPARAM, ctypes.wintypes.LPARAM)
+        @_HOOKPROC
         def mouse_proc(code, wparam, lparam):
             if code >= 0 and wparam == 0x0201 and self._hwnd:  # WM_LBUTTONDOWN
                 rect = ctypes.wintypes.RECT()
@@ -162,7 +181,7 @@ class PopupHost:
                         ('flags', ctypes.wintypes.DWORD), ('time', ctypes.wintypes.DWORD),
                         ('dwExtraInfo', ctypes.POINTER(ctypes.c_ulong))]
 
-        @ctypes.WINFUNCTYPE(ctypes.c_long, ctypes.c_int, ctypes.wintypes.WPARAM, ctypes.wintypes.LPARAM)
+        @_HOOKPROC
         def kb_proc(code, wparam, lparam):
             if code >= 0 and wparam == 0x0100:  # WM_KEYDOWN
                 info = ctypes.cast(lparam, ctypes.POINTER(KBDLLHOOKSTRUCT)).contents
