@@ -249,10 +249,15 @@ class TestCssScale(unittest.TestCase):
     content in CSS pixels would give the page less than it needs.
     """
 
-    def _scale(self, display):
+    def _scale(self, display, webkit_zooms=True):
         host = PopupHost(MagicMock(), WIDTH)
-        with patch.object(host, '_display', return_value=display):
+        with patch.object(host, '_display', return_value=display), \
+             patch.object(host, '_webkit_zooms_by_dpi', return_value=webkit_zooms):
             return host._css_scale()
+
+    def test_webkit_without_dpi_zoom_leaves_the_size_alone(self):
+        """Before WebKitGTK 2.46 a CSS pixel is one window pixel at any resolution."""
+        self.assertEqual(self._scale(_display_with_resolution(120.0), webkit_zooms=False), 1.0)
 
     def test_fractional_scale_enlarges_the_window(self):
         """Xft.dpi 240 at GTK scale 2 reports 120 dpi: the page gets 1/1.25 of the window."""
@@ -288,6 +293,31 @@ class TestCssScale(unittest.TestCase):
         for resolution in (93.0, 98.0):
             with self.subTest(resolution=resolution):
                 self.assertEqual(self._scale(_display_with_resolution(resolution)), resolution / 96)
+
+
+class TestWebKitVersionGate(unittest.TestCase):
+    """Tests for detecting a WebKitGTK that zooms pages by the font resolution."""
+
+    def _zooms(self, major, minor):
+        webkit = MagicMock(get_major_version=lambda: major, get_minor_version=lambda: minor)
+        host = PopupHost(MagicMock(), WIDTH)
+        with patch.dict(sys.modules, {'gi': MagicMock(), 'gi.repository': MagicMock(WebKit2=webkit)}):
+            return host._webkit_zooms_by_dpi()
+
+    def test_versions_before_2_46_do_not_zoom(self):
+        for major, minor in ((2, 44), (2, 40), (1, 99)):
+            with self.subTest(version=(major, minor)):
+                self.assertFalse(self._zooms(major, minor))
+
+    def test_versions_from_2_46_zoom(self):
+        for major, minor in ((2, 46), (2, 50), (3, 0)):
+            with self.subTest(version=(major, minor)):
+                self.assertTrue(self._zooms(major, minor))
+
+    def test_without_pygobject_reports_no_zoom(self):
+        host = PopupHost(MagicMock(), WIDTH)
+        with patch.dict(sys.modules, {'gi': None}):
+            self.assertFalse(host._webkit_zooms_by_dpi())
 
 
 class TestScaledGeometry(unittest.TestCase):

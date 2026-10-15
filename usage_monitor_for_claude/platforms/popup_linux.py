@@ -47,6 +47,9 @@ _BASELINE_DPI = 96
 # zoom at 1.0; see _css_scale().
 _ZOOM_THRESHOLD = 0.02
 
+# First WebKitGTK (major, minor) that zooms pages by the font resolution.
+_WEBKIT_DPI_ZOOM_VERSION = (2, 46)
+
 # Seconds between safety-net checks in the dismiss watch; see watch_dismiss().
 _WATCH_HEARTBEAT = 2.0
 
@@ -350,6 +353,9 @@ class PopupHost:
         ``gdk_screen_get_resolution()`` call, and it keeps the zoom at 1.0 for
         a resolution within ``_ZOOM_THRESHOLD`` of 96 dpi, so this does too.
         """
+        if not self._webkit_zooms_by_dpi():
+            return 1.0
+
         display = self._display()
         if display is None:
             return 1.0
@@ -364,6 +370,22 @@ class PopupHost:
             return 1.0
 
         return scale
+
+    def _webkit_zooms_by_dpi(self) -> bool:
+        """Return whether the WebKitGTK in use zooms pages by the font resolution.
+
+        The zoom arrived with WebKitGTK 2.46 (WebKit commit 5713584438, bug
+        247980).  Before that the resolution scaled text only and a CSS pixel
+        stayed one window pixel, so enlarging the window would leave blank
+        space.  pywebview has already chosen the ``WebKit2`` version by the
+        time a popup exists, so the import gets the library actually in use.
+        """
+        try:
+            from gi.repository import WebKit2
+        except ImportError:
+            return False
+
+        return (WebKit2.get_major_version(), WebKit2.get_minor_version()) >= _WEBKIT_DPI_ZOOM_VERSION
 
     def _display(self) -> Any:
         """Return the default Gdk display, or None without a session."""
